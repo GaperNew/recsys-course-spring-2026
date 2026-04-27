@@ -275,22 +275,7 @@ class AdaptiveHybridRecommender(Recommender):
         return table
 
     def _repetition_penalty(self, cand, history):
-        cand_artist = self._artist(cand)
-
-        if cand_artist is None:
-            return 0.0
-
-        recent_artists = []
-
-        for track, _ in history[:4]:
-            recent_artists.append(self._artist(track))
-
-        repeats = sum(1 for artist in recent_artists if artist == cand_artist)
-
-        if repeats <= 1:
-            return 0.0
-
-        return 0.10 * (repeats - 1)
+        return 0.0
 
     def _choose_source_label(self, row):
         if not row["sources"]:

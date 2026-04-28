@@ -1,12 +1,15 @@
 import json
 import math
 import pickle
+from collections import defaultdict
 
 from .recommender import Recommender
 
 
 class AdaptiveHybridRecommender(Recommender):
     SOURCE_HSTU = "hstu"
+    SOURCE_SASREC = "sasrec"
+    SOURCE_LFM = "lfm"
     SOURCE_BASELINE = "baseline"
 
     def __init__(
@@ -19,23 +22,28 @@ class AdaptiveHybridRecommender(Recommender):
         catalog,
         baseline_recommender,
         fallback_recommender,
-        max_history=10,
-        max_hstu=30,
-        min_prev_time_for_override=0.35,
-        margin=0.02,
+        max_history=3,
+        max_hstu=40,
+        topk_per_anchor=8,
+        min_prev_time_for_override=0.40,
+        margin=0.035,
     ):
         self.listen_history_redis = listen_history_redis
         self.hstu_redis = hstu_redis
+        self.sasrec_redis = sasrec_redis
+        self.lightfm_redis = lightfm_redis
         self.catalog = catalog
         self.baseline_recommender = baseline_recommender
         self.fallback_recommender = fallback_recommender
 
         self.max_history = int(max_history)
         self.max_hstu = int(max_hstu)
+        self.topk_per_anchor = int(topk_per_anchor)
         self.min_prev_time_for_override = float(min_prev_time_for_override)
         self.margin = float(margin)
 
         self._hstu_cache = {}
+        self._i2i_cache = {}
 
     def _safe_int(self, value, default=None):
         try:
@@ -94,11 +102,36 @@ class AdaptiveHybridRecommender(Recommender):
         self._hstu_cache[user] = result
         return result
 
+    def _load_i2i(self, source, track):
+        track = int(track)
+        cache_key = (source, track)
+
+        if cache_key in self._i2i_cache:
+            return self._i2i_cache[cache_key]
+
+        if source == self.SOURCE_SASREC:
+            redis_conn = self.sasrec_redis
+        else:
+            redis_conn = self.lightfm_redis
+
+        raw = redis_conn.get(track)
+        recs = self._loads_pickle(raw, [])
+
+        result = []
+
+        for x in recs:
+            value = self._safe_int(x)
+            if value is not None:
+                result.append(value)
+
+        self._i2i_cache[cache_key] = result
+        return result
+
     def _bandit_key(self, user):
-        return f"user:{int(user)}:adaptive_hybrid_fast:source_score"
+        return f"user:{int(user)}:adaptive_hybrid_balanced:source_score"
 
     def _pending_key(self, user):
-        return f"user:{int(user)}:adaptive_hybrid_fast:pending"
+        return f"user:{int(user)}:adaptive_hybrid_balanced:pending"
 
     def _source_multiplier(self, user, source):
         raw = self.listen_history_redis.hget(self._bandit_key(user), source)
@@ -111,7 +144,7 @@ class AdaptiveHybridRecommender(Recommender):
                 raw = raw.decode("utf-8")
 
             ema = float(raw)
-            return min(1.25, max(0.80, 0.80 + ema))
+            return min(1.28, max(0.78, 0.80 + ema))
         except Exception:
             return 1.0
 
@@ -147,7 +180,7 @@ class AdaptiveHybridRecommender(Recommender):
         except Exception:
             old = 0.50
 
-        new = 0.88 * old + 0.12 * reward
+        new = 0.86 * old + 0.14 * reward
         self.listen_history_redis.hset(key, source, new)
 
     def _remember_recommendation_source(self, user, track, source):
@@ -159,6 +192,79 @@ class AdaptiveHybridRecommender(Recommender):
         )
 
         self.listen_history_redis.setex(self._pending_key(user), 3600, payload)
+
+    def _add_candidate(self, table, cand, source, value):
+        cand = self._safe_int(cand)
+
+        if cand is None:
+            return
+
+        row = table[cand]
+        row["score"] += float(value)
+        row["sources"][source] += float(value)
+
+    def _build_candidates(self, user, history, seen, baseline):
+        table = defaultdict(lambda: {"score": 0.0, "sources": defaultdict(float)})
+
+        if baseline is not None and baseline not in seen:
+            self._add_candidate(table, baseline, self.SOURCE_BASELINE, 1.05)
+
+        hstu_recs = self._load_hstu(user)
+
+        for rank, cand in enumerate(hstu_recs[: self.max_hstu], start=1):
+            if cand in seen:
+                continue
+
+            value = 0.72 / math.sqrt(rank + 2.0)
+            self._add_candidate(table, cand, self.SOURCE_HSTU, value)
+
+        for pos, pair in enumerate(history[: self.max_history]):
+            anchor, listened_time = pair
+
+            listened_time = max(0.0, min(1.0, float(listened_time)))
+            anchor_weight = (0.68 ** pos) * (0.25 + listened_time)
+
+            sasrec_neighbours = self._load_i2i(self.SOURCE_SASREC, anchor)[
+                : self.topk_per_anchor
+            ]
+
+            for rank, cand in enumerate(sasrec_neighbours, start=1):
+                if cand in seen:
+                    continue
+
+                value = 0.95 * anchor_weight / (rank + 1.7)
+                self._add_candidate(table, cand, self.SOURCE_SASREC, value)
+
+            lightfm_neighbours = self._load_i2i(self.SOURCE_LFM, anchor)[
+                : self.topk_per_anchor
+            ]
+
+            for rank, cand in enumerate(lightfm_neighbours, start=1):
+                if cand in seen:
+                    continue
+
+                value = 0.60 * anchor_weight / (rank + 2.2)
+                self._add_candidate(table, cand, self.SOURCE_LFM, value)
+
+        for cand, row in table.items():
+            adjusted = 0.0
+
+            for source, value in row["sources"].items():
+                adjusted += value * self._source_multiplier(user, source)
+
+            row["score"] = adjusted
+
+        for bad in list(table.keys()):
+            if bad in seen:
+                del table[bad]
+
+        return table
+
+    def _choose_source_label(self, row):
+        if not row["sources"]:
+            return "unknown"
+
+        return max(row["sources"].items(), key=lambda x: x[1])[0]
 
     def _safe_baseline(self, user, prev_track, prev_track_time):
         try:
@@ -173,30 +279,6 @@ class AdaptiveHybridRecommender(Recommender):
         except Exception:
             return None
 
-    def _best_hstu_candidate(self, user, seen):
-        best = None
-        best_score = -1.0
-
-        hstu_recs = self._load_hstu(user)
-
-        for rank, cand in enumerate(hstu_recs[: self.max_hstu], start=1):
-            cand = self._safe_int(cand)
-
-            if cand is None:
-                continue
-
-            if cand in seen:
-                continue
-
-            score = 1.0 / math.sqrt(rank + 1.0)
-            score *= self._source_multiplier(user, self.SOURCE_HSTU)
-
-            if score > best_score:
-                best = cand
-                best_score = score
-
-        return best, best_score
-
     def recommend_next(self, user: int, prev_track: int, prev_track_time: float) -> int:
         user = int(user)
         prev_track = int(prev_track)
@@ -208,29 +290,47 @@ class AdaptiveHybridRecommender(Recommender):
         history = self._load_history(user)
         seen = {int(track) for track, _ in history}
 
-        hstu_candidate, hstu_score = self._best_hstu_candidate(user, seen)
-
-        if hstu_candidate is None:
+        if not history:
             if baseline is not None:
                 self._remember_recommendation_source(user, baseline, self.SOURCE_BASELINE)
                 return baseline
 
             return self.fallback_recommender.recommend_next(user, prev_track, prev_track_time)
 
-        use_hstu = False
+        candidates = self._build_candidates(user, history, seen, baseline)
 
-        if baseline is None:
-            use_hstu = True
-        elif hstu_candidate != baseline:
+        if not candidates:
+            if baseline is not None:
+                self._remember_recommendation_source(user, baseline, self.SOURCE_BASELINE)
+                return baseline
+
+            return self.fallback_recommender.recommend_next(user, prev_track, prev_track_time)
+
+        ranked = []
+
+        for cand, row in candidates.items():
+            ranked.append((row["score"], int(cand), row))
+
+        ranked.sort(reverse=True)
+
+        best_score, best, best_row = ranked[0]
+
+        baseline_score = None
+
+        if baseline in candidates:
+            baseline_score = candidates[baseline]["score"]
+
+        use_best = baseline is None
+
+        if baseline is not None and best != baseline:
             if prev_track_time >= self.min_prev_time_for_override:
-                baseline_score = 0.48 * self._source_multiplier(user, self.SOURCE_BASELINE)
+                if baseline_score is None or best_score >= baseline_score + self.margin:
+                    use_best = True
 
-                if hstu_score >= baseline_score + self.margin:
-                    use_hstu = True
-
-        if use_hstu:
-            self._remember_recommendation_source(user, hstu_candidate, self.SOURCE_HSTU)
-            return int(hstu_candidate)
+        if use_best:
+            source = self._choose_source_label(best_row)
+            self._remember_recommendation_source(user, best, source)
+            return int(best)
 
         self._remember_recommendation_source(user, baseline, self.SOURCE_BASELINE)
         return int(baseline)
